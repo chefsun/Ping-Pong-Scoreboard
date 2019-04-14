@@ -3,18 +3,28 @@
 # confidence for bounces, can be updated with more frame history
 
 from collections import deque
+from enum import Enum, auto
+from dataclasses import dataclass
 
 import numpy as np
 import cv2 as cv
 from matplotlib import colors
 
-gameState = ['unknown', 'newServe', 'onGame', 'dead']
+#gameState = ['unknown', 'newServe', 'onGame', 'dead']
+class gameState(Enum):
+    UNKNOWN = auto()        # unknown state
+    NEWPOINT = auto()       # waiting for someone to serve
+    CHECKSERVE = auto()     # checking for a correct serve
+    INPLAY = auto()         # point is being played (checking for end of point)
 
 BallPos = ['unknown', 'inAirOverTable', 'inAirBelowTable',
            'onGround', 'touchLeftTable', 'touchNet', 'touchRightTable']
 
 _ball_buffer_size = 999999
+_possible_traj_size = 5
 
+_ball_width = 0.040 # 40mm
+fps = 1
 
 class ScoreBoard:
     """Record/display points, serve reminder, and game point alert.
@@ -25,18 +35,51 @@ class ScoreBoard:
     def __init__(self):
         pass
 
+@dataclass
+class balldet:
+    x: float
+    y: float
+    vel: float
+    angle: float
+    size_px: float
+    # vx, vy instead of vel/angle ?
 
 class Ball:
 
     def __init__(self):
 
+        self.possible_traj = np.ndarray(_possible_traj_size, dtype=object)
+        for i in range(_possible_traj_size):
+            self.possible_traj[i] = deque(maxlen=_ball_buffer_size)
+        self.best_traj_ix = -1
         self.traj = deque(maxlen=_ball_buffer_size)
         self.state = 'unknown'
+        self.guess = balldet(300, 300, 0.5, 90, 50) # initial guess for ball position
 
-    def update(self, fidx, x, y, h):
+    def update(self, fidx, balldet):
 
-        self.traj.append((fidx, x, y, h))
-
+        self.traj.append((fidx, balldet))
+        
+        # update guess
+        # TODO: average over a few past trajectory points, or use parabolic fit
+        # TODO: determine sign of velocities based on past trajectory, or at worst, which end of table it's on
+        a = self.traj[-1][1].angle
+        vi = self.traj[-1][1].vel
+        xi = self.traj[-1][1].x
+        yi = self.traj[-1][1].y
+        vx = vi*np.sin(a)
+        vy = vi*np.cos(a)
+        px_m = balldet.size_px / _ball_width
+        
+        print("last point: ", self.traj[-1][1])
+        
+        self.guess.x = xi + vx/fps*px_m
+        self.guess.y = yi + vy/fps*px_m
+        self.guess.angle = a
+        self.guess.vel = vi
+        
+        print("guess: ", self.guess)
+        
         # TODO: Impl this method with the table geometry.
         self.state = BallPos[np.random.randint(len(BallPos))]
 
@@ -44,7 +87,6 @@ class Ball:
 
         self.traj.clear()
         self.state = 'unknown'
-
 
 class Game:
 
@@ -55,13 +97,16 @@ class Game:
         self.scoreboard = scoreboard
 
         self.name = name
-        self.state = 'unknown'
+        self.state = gameState.NEWPOINT
 
         # get the properties of video
         self.W = int(self.stream.get(cv.CAP_PROP_FRAME_WIDTH))
         self.H = int(self.stream.get(cv.CAP_PROP_FRAME_HEIGHT))
         self.FPS = int(self.stream.get(cv.CAP_PROP_FPS))
-
+        global fps
+        fps = self.FPS
+        print("Source FPS: ", self.FPS)
+        
         self.cnt = 0
         
         # save last 5 frames
@@ -75,10 +120,10 @@ class Game:
 
         self._calibrate()
         
-        cv.namedWindow("contours", cv.WINDOW_NORMAL)
-        cv.resizeWindow("contours", 1200,720)
-        cv.namedWindow("difference", cv.WINDOW_NORMAL)
-        cv.resizeWindow("difference", 1200,720)
+        cv.namedWindow("view", cv.WINDOW_NORMAL)
+        cv.resizeWindow("view", 1200,720)
+        #cv.namedWindow("difference", cv.WINDOW_NORMAL)
+        #cv.resizeWindow("difference", 1200,720)
 
         while self.stream.isOpened():
             # get current frame
@@ -88,10 +133,22 @@ class Game:
                 self.fbuf[newpos] = cv.extractChannel(frame, 2) #cv.cvtColor(frame, cv.COLOR_BGR2GRAY)   #frame.copy()
                 self.bufpos = newpos
                 
-                x, y, h = self._get_ball_pos(frame)
-                self._update(self.cnt, x, y, h)
-
+                balls = self._get_ball_pos(frame)
+                self._update(self.cnt, balls)
+                
+                # testing: draw possible balls, selected ball, and prediction (guess)
+                for b in balls:
+                    cv.circle(frame, (int(round(b.x)), int(round(b.y))), int(round(b.size_px/2)), [0,200,200], 1, cv.LINE_AA)
+                if len(self.ball.traj) > 0:
+                    cv.circle(frame, (int(round(self.ball.traj[-1][1].x)), int(round(self.ball.traj[-1][1].y))), 5, [100,255,0], -1, cv.LINE_AA)
+                cv.circle(frame, (int(round(self.ball.guess.x)), int(round(self.ball.guess.y))), 5, [0,100,255], -1, cv.LINE_AA)
+            
+                cv.imshow("view", frame)
+                cv.waitKey(10)
                 self.cnt += 1
+            key = cv.waitKey(0) & 0xFF
+            if key == ord('q'):
+                break
 
     def _calibrate(self):
         # fill up the buffer of frames
@@ -103,6 +160,8 @@ class Game:
                 self.bufpos = newpos
 
     def _get_ball_pos(self, frame):
+        
+        possible_balls = deque(maxlen=10)
         
         #hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
         #h = hsv[:,:,0]
@@ -134,21 +193,21 @@ class Game:
             # this should be calibrated at beginning
             if a_cont < 700:    
                 # draw magenta to indicate filtered out by area
-                cv.drawContours(frame, [c], 0, (255,0,255), 1)
+                #cv.drawContours(frame, [c], 0, (255,0,255), 1)
                 continue
                 
             # check convexity
             hull = cv.convexHull(c)
             a_hull = cv.contourArea(hull)
-            cv.putText(frame, str(round(a_hull/a_cont,2)), (int(c[0,0,0]),int(c[0,0,1])), cv.FONT_HERSHEY_PLAIN, 1, (100,50,50), 1, cv.LINE_AA)
+            #cv.putText(frame, str(round(a_hull/a_cont,2)), (int(c[0,0,0]),int(c[0,0,1])), cv.FONT_HERSHEY_PLAIN, 1, (100,50,50), 1, cv.LINE_AA)
             if a_hull/a_cont > 1.15:
-                cv.drawContours(frame, [c], 0, (50,150,0), 1)
+                #cv.drawContours(frame, [c], 0, (50,150,0), 1)
                 continue
             
             circularity = a_cont / (per**2/(16*np.pi))
             if circularity < 0.9:
                 # draw blue to indicate filtered out by circularity
-                cv.drawContours(frame, [c], 0, (255,100,0), 1)
+                #cv.drawContours(frame, [c], 0, (255,100,0), 1)
                 continue
             
             if c.shape[0] >= 5:
@@ -159,15 +218,15 @@ class Game:
                 ar = ma/MA
                 if ar < 1 or ar > 6:
                     # draw red to indicate filtered by aspect ratio
-                    cv.drawContours(frame, [c], 0, (0,50,255), 1)
+                    #cv.drawContours(frame, [c], 0, (0,50,255), 1)
                     continue
                     
                 # filter by minimum dimension (ball width)
                 # this should be in a certain range for min and max distance to ball
                 if MA < 30 or MA > 66:
                     # draw orange to indicate filtered by width
-                    cv.drawContours(frame, [c], 0, (0,0,0), 1)
-                    cv.putText(frame, str(round(MA,1)), (int(x),int(y)), cv.FONT_HERSHEY_PLAIN, 1, (0,150,255), 1, cv.LINE_AA)
+                    #cv.drawContours(frame, [c], 0, (0,0,0), 1)
+                    #cv.putText(frame, str(round(MA,1)), (int(x),int(y)), cv.FONT_HERSHEY_PLAIN, 1, (0,150,255), 1, cv.LINE_AA)
                     continue
                 
                 # filter by color (hue and saturation):
@@ -192,13 +251,15 @@ class Game:
                     # sat 37 65 144
                     # hue 251 1 14 21
                 if (hue < 238 and hue > 28) or (sat < 30 or sat > 220):
-                    cv.drawContours(frame, [c], 0, (0,0,0), 1)
-                    cv.putText(frame, str(int(sat)), (int(x),int(y)), cv.FONT_HERSHEY_PLAIN, 1.3, (255,255,0), 1, cv.LINE_AA)
-                    cv.putText(frame, str(int(hue)), (int(x),int(y)+10), cv.FONT_HERSHEY_PLAIN, 1.3, (0,255,255), 1, cv.LINE_AA)
+                    # draw contour black and print hue/sat to indicate filtered by hsv
+                    #cv.drawContours(frame, [c], 0, (0,0,0), 1)
+                    #cv.putText(frame, str(int(sat)), (int(x),int(y)), cv.FONT_HERSHEY_PLAIN, 1.3, (255,255,0), 1, cv.LINE_AA)
+                    #cv.putText(frame, str(int(hue)), (int(x),int(y)+10), cv.FONT_HERSHEY_PLAIN, 1.3, (0,255,255), 1, cv.LINE_AA)
                     continue
         
                 # draw green to indicate remaining candidate balls:
                 cv.drawContours(frame, [c], 0, (80, 255, 0), 2)
+                possible_balls.append(balldet(x, y, (ma/MA-1)*_ball_width*self.FPS, angle, MA))
                 #cv.putText(frame, str(round(a_cont,0)), (int(x),int(y)), cv.FONT_HERSHEY_PLAIN, 1, (100,50,50), 1, cv.LINE_AA)
             
         # TODO: try using matchShape with a straight blur or bounce blur template
@@ -207,20 +268,42 @@ class Game:
         # filter by hue / color (chroma key)
         # convexity / convexity defects
         
-        cv.imshow("contours", frame)
+        #cv.imshow("contours", frame)
         #cv.imshow("difference", diff2)
-        cv.waitKey(15)
-        cv.waitKey(0)
+        #cv.waitKey(15)
         
         #print("\n")
         
-        
-        
-        return (0, 0, 0)
+        return possible_balls
 
-    def _update(self, fidx, x, y, h):
-
-        self.ball.update(fidx, x, y, h)
+    def _update(self, fidx, balls):
+        if len(balls) == 0:
+            return
+            
+        ## ROBUST METHOD
+        # see if this ball matches any existing possible trajectory
+        # pick the best match
+        #   or
+        # for each possible trajectory, choose the possible ball closest to its prediction
+        # if it's too far out of predicted range, don't update it. keep track of stale frame count for trajectory
+        
+        # if trajectory is too stale (# of frames w/o update), remove it
+            
+        ## SIMPLE METHOD
+        # choose the ball closest to the current prediction
+        dist2 = np.ndarray(len(balls), dtype=object)
+        ix = 0
+        for b in balls:
+            print(b)
+            dist2[ix] = (b.x - self.ball.guess.x)**2 + (b.y - self.ball.guess.y)**2
+            ix = ix + 1
+        
+        imin = np.argmin(dist2)
+        self.ball.update(fidx, balls[imin])
+        
+        print("\n")
+        
+        #self.ball.update(fidx, balls)
         self._analyse()
 
     def _analyse(self):
